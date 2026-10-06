@@ -1,19 +1,33 @@
 /**
  * 修复工序 store（Pinia setup store）
  * 维护工序顺序、拖拽重排落库重编号与完成态；完成即回写书叶状态。
+ * 登记工序失败时只把本侧那一条落到 repairTaskOutbox 重试发件箱，
+ * 重试仅回写 repairOrders，绝不触碰库房调阅单 / 预约记录（两侧故障隔离）。
  */
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { createId, db, readUiPrefs, writeUiPrefs } from '@/utils/db'
+import { retryOutboxEntry } from '@/utils/circulation'
 import { createEmptyOrderDraft, type OrderState, type RepairOrder, type RepairOrderDraft } from '@/types/repairOrder'
+import { createOutboxEntry, type RepairTaskOutbox } from '@/types/repairTaskOutbox'
 import { useLeafStore } from './leafStore'
+
+export interface RegisterResult {
+  ok: boolean
+  /** 失败时是否已落到本侧重试发件箱 */
+  queued: boolean
+  message: string
+}
 
 export const useRepairStore = defineStore('repair', () => {
   const orders = ref<RepairOrder[]>([])
+  const outbox = ref<RepairTaskOutbox[]>([])
   const loading = ref(false)
   const ready = ref(false)
   const error = ref('')
   const sortMode = ref<'manual' | 'leaf'>(readUiPrefs().repairSort)
+  /** 修复室侧模拟「登记工序失败」开关（演示本侧失败只重试本侧） */
+  const simulateFailure = ref(false)
 
   const orderedOrders = computed<RepairOrder[]>(() =>
     [...orders.value].sort((a, b) =>
@@ -40,6 +54,72 @@ export const useRepairStore = defineStore('repair', () => {
     } finally {
       loading.value = false
     }
+  }
+
+  async function loadOutbox(): Promise<void> {
+    const rows = await db.repairTaskOutbox.toArray()
+    rows.sort((a, b) => b.updatedAt - a.updatedAt)
+    outbox.value = rows
+  }
+
+  const pendingOutboxCount = computed<number>(() => outbox.value.filter((item) => item.status === 'pending').length)
+
+  function setSimulateFailure(value: boolean): void {
+    simulateFailure.value = value
+  }
+
+  /**
+   * 修复室登记一道工序（本侧）。
+   * 打开「模拟本侧登记失败」时不写 repairOrders，而是把这一条落到本侧重试发件箱；
+   * 库房的调阅单 / 预约记录全程不参与、不被改动。
+   */
+  async function registerOrder(draft: RepairOrderDraft): Promise<RegisterResult> {
+    if (simulateFailure.value) {
+      const now = Date.now()
+      const row: RepairTaskOutbox = {
+        ...createOutboxEntry(
+          draft.leafId,
+          { ...draft, id: createId('order'), createdAt: now, updatedAt: now },
+          '修复室本侧登记工序失败（模拟），已入本侧重试队列；库房调阅单不动'
+        ),
+        id: createId('outbox'),
+        createdAt: now,
+        updatedAt: now
+      }
+      await db.repairTaskOutbox.put(row)
+      await loadOutbox()
+      return { ok: false, queued: true, message: '本侧工序登记失败，已落到修复室本侧重试队列（库房调阅单未改动）' }
+    }
+    await createOrder(draft)
+    return { ok: true, queued: false, message: '工序已登记' }
+  }
+
+  /** 只重试本侧那几条：逐条把发件箱快照回写到 repairOrders，不触碰库房表 */
+  async function retryPendingOutbox(): Promise<{ done: number; failed: number }> {
+    const pending = outbox.value.filter((item) => item.status === 'pending')
+    let done = 0
+    let failed = 0
+    for (const entry of pending) {
+      try {
+        await retryOutboxEntry(entry)
+        done += 1
+      } catch {
+        failed += 1
+        await db.repairTaskOutbox.update(entry.id, {
+          attempts: entry.attempts + 1,
+          lastAttemptAt: Date.now(),
+          lastError: '重试仍失败（本侧），保留在队列稍后再试',
+          updatedAt: Date.now()
+        } as never)
+      }
+    }
+    await Promise.all([loadOutbox(), loadOrders()])
+    return { done, failed }
+  }
+
+  async function abandonOutbox(id: string): Promise<void> {
+    await db.repairTaskOutbox.update(id, { status: 'abandoned', updatedAt: Date.now() } as never)
+    await loadOutbox()
   }
 
   function ordersOfLeaf(leafId: string): RepairOrder[] {
@@ -157,14 +237,22 @@ export const useRepairStore = defineStore('repair', () => {
   return {
     orders,
     orderedOrders,
+    outbox,
     loading,
     ready,
     error,
     sortMode,
+    simulateFailure,
     totalSteps,
     doneSteps,
     donePercent,
+    pendingOutboxCount,
     loadOrders,
+    loadOutbox,
+    registerOrder,
+    retryPendingOutbox,
+    abandonOutbox,
+    setSimulateFailure,
     ordersOfLeaf,
     nextSeq,
     createOrder,

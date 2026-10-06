@@ -4,9 +4,9 @@
  * 拖拽排序并回填材料与操作人，完成即回写书叶状态；未完成前置工序时提示。
  * 消费 RepairOrder、Leaf；复用 <DamageTag>、<StatBadge>、<EmptyPanel>、<FilterBar>。
  */
-import { computed, reactive, ref, watch, watchEffect } from 'vue'
+import { computed, onMounted, reactive, ref, watch, watchEffect } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Check, Delete, Edit, Plus, Rank } from '@element-plus/icons-vue'
+import { Check, Delete, Edit, Plus, Rank, RefreshRight, Warning } from '@element-plus/icons-vue'
 import DamageTag from '@/components/common/DamageTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { useFilterQuery, type FilterModel } from '@/components/common/FilterBar.vue'
@@ -28,12 +28,17 @@ import {
   type RepairOrder,
   type RepairOrderDraft
 } from '@/types/repairOrder'
+import { OUTBOX_STATUS_COLOR, OUTBOX_STATUS_LABEL } from '@/types/repairTaskOutbox'
 import { PAPER_TYPE_LABEL, type Paper } from '@/types/paper'
 
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+
+onMounted(() => {
+  void repairStore.loadOutbox()
+})
 
 const FILTER_KEYS = ['name', 'state'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -168,10 +173,43 @@ async function submit(): Promise<void> {
     await repairStore.updateOrder(editing.value.id, { ...form })
     ElMessage.success('已更新工序')
   } else {
-    await repairStore.createOrder({ ...form })
-    ElMessage.success(`已新增第 ${form.seq} 道工序`)
+    // 登记走「本侧失败入箱」路径：失败只重试本侧，库房调阅单 / 预约全程不动
+    const result = await repairStore.registerOrder({ ...form })
+    if (result.ok) ElMessage.success(`已新增第 ${form.seq} 道工序`)
+    else ElMessage.warning(result.message)
   }
   dialog.value = false
+}
+
+/* --------------------- 本侧重试发件箱（故障隔离） --------------------- */
+const failSimulation = computed({
+  get: () => repairStore.simulateFailure,
+  set: (value: boolean) => repairStore.setSimulateFailure(value)
+})
+
+function outboxLeafLabel(leafId: string): string {
+  const leaf = leafStore.leafById(leafId)
+  return leaf ? `第 ${leaf.leafNo} 叶` : `书叶 ${leafId.slice(-6)}`
+}
+
+async function retryOutbox(): Promise<void> {
+  const { done, failed } = await repairStore.retryPendingOutbox()
+  if (done > 0) ElMessage.success(`已重试本侧 ${done} 条工序并回写（未触碰库房调阅单）`)
+  if (failed > 0) ElMessage.warning(`${failed} 条本侧重试仍失败，已留在本侧队列`)
+  if (done === 0 && failed === 0) ElMessage.info('本侧重试队列为空')
+}
+
+async function abandonOutboxEntry(id: string): Promise<void> {
+  await repairStore.abandonOutbox(id)
+  ElMessage.info('已将该条本侧失败登记标记为放弃')
+}
+
+function outboxStatusColor(status: string): string {
+  return OUTBOX_STATUS_COLOR[status as keyof typeof OUTBOX_STATUS_COLOR] ?? '#8c8c8c'
+}
+
+function outboxStatusLabel(status: string): string {
+  return OUTBOX_STATUS_LABEL[status as keyof typeof OUTBOX_STATUS_LABEL] ?? status
 }
 
 async function remove(order: RepairOrder): Promise<void> {
@@ -365,6 +403,64 @@ watchEffect(() => {
           description="请先完成前置工序，再推进后续工序，避免修复记录出现跳步。"
         />
       </div>
+    </el-card>
+
+    <!-- 修复室本侧故障隔离：登记失败只重试本侧，库房调阅单不动 -->
+    <el-card shadow="never" style="margin-top: 16px">
+      <template #header>
+        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px">
+          <span><el-icon><Warning /></el-icon> 修复室本侧登记失败 · 重试队列</span>
+          <div style="display: flex; align-items: center; gap: 10px">
+            <el-tooltip content="开启后新增工序不写本侧工序表、改为落入本侧重试队列，用于演示失败隔离；库房调阅单 / 预约记录全程不动。" placement="top">
+              <el-checkbox v-model="failSimulation" size="small">模拟本侧登记失败</el-checkbox>
+            </el-tooltip>
+            <el-button size="small" type="primary" plain :icon="RefreshRight" @click="retryOutbox">
+              只重试本侧（{{ repairStore.pendingOutboxCount }}）
+            </el-button>
+          </div>
+        </div>
+      </template>
+
+      <EmptyPanel
+        v-if="repairStore.outbox.length === 0"
+        title="本侧重试队列为空"
+        description="修复室登记工序失败后只把本侧那几条放到这里重试，重试仅回写工序表，绝不触碰库房调阅单 / 预约。"
+        size="small"
+      />
+      <el-table v-else :data="repairStore.outbox" size="small" border>
+        <el-table-column label="对象" width="110">
+          <template #default="{ row }">{{ outboxLeafLabel(row.leafId) }}</template>
+        </el-table-column>
+        <el-table-column label="工序" min-width="150">
+          <template #default="{ row }">
+            第 {{ row.payload.seq }} 道 · {{ REPAIR_NAME_LABEL[row.payload.name as keyof typeof REPAIR_NAME_LABEL] ?? '—' }}
+            <span class="gb-muted">{{ row.payload.operator }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :style="{ color: outboxStatusColor(row.status), borderColor: `${outboxStatusColor(row.status)}66` }" effect="plain" round size="small">
+              {{ outboxStatusLabel(row.status) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="失败原因 / 重试次数" min-width="200">
+          <template #default="{ row }">
+            <span class="gb-muted">{{ row.lastError || '—' }}</span>
+            <el-tag size="small" effect="plain" style="margin-left: 6px">已重试 {{ row.attempts }} 次</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="150">
+          <template #default="{ row }">
+            <el-button v-if="row.status === 'pending'" size="small" text type="primary" :icon="RefreshRight" @click="retryOutbox">
+              重试本侧
+            </el-button>
+            <el-button v-if="row.status === 'pending'" size="small" text type="info" @click="abandonOutboxEntry(row.id)">
+              放弃
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
     </el-card>
 
     <el-dialog v-model="dialog" :title="editing ? `编辑第 ${editing.seq} 道工序` : '新增修复工序'" width="560px">

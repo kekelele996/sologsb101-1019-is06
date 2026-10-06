@@ -34,6 +34,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '修复工序记录', icon: 'Tools' }
   },
   {
+    path: '/circulation',
+    name: 'circulation-board',
+    component: () => import('@/pages/CirculationBoard.vue'),
+    meta: { title: '库房修复占用协同', icon: 'Lock' }
+  },
+  {
     path: '/export',
     name: 'export-view',
     component: () => import('@/pages/ExportView.vue'),

@@ -14,6 +14,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useCirculationStore } from '@/stores/circulationStore'
 import {
   BINDING_METHOD_OPTIONS,
   BINDING_VERDICT_COLOR,
@@ -48,6 +49,7 @@ import {
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const circulationStore = useCirculationStore()
 const { totals } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
@@ -140,10 +142,13 @@ async function submit(): Promise<void> {
       form.verdict === 'pass' ? '验收合格，已登记装订还原' : '已登记验收返修，请返回工序页重新处理'
     )
   }
-  // 验收合格 → 触发全册归档；返修 → 回退为修复中
+  // 验收合格 → 触发全册归档并解除修复占用（挂起调阅单随之恢复待放行）；返修 → 回退为修复中
   await bookStore.updateVolume(form.volumeId, {
     state: form.verdict === 'pass' ? 'archived' : 'repairing'
   })
+  if (form.verdict === 'pass') {
+    await circulationStore.releaseActiveByVolumeId(form.volumeId)
+  }
   ElMessage.info(
     form.verdict === 'pass'
       ? `第 ${volumeLabel(form.volumeId)} 已归档，整册锁定为只读`
@@ -208,7 +213,14 @@ async function handleFile(event: Event): Promise<void> {
     return
   }
   await importSnapshot(parsed as RestoreSnapshot)
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    repairStore.loadOutbox(),
+    circulationStore.loadAll()
+  ])
   ElMessage.success('导入完成，数据已覆盖')
 }
 
@@ -223,7 +235,14 @@ async function handleReset(): Promise<void> {
     return
   }
   await resetDatabase()
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    repairStore.loadOutbox(),
+    circulationStore.loadAll()
+  ])
   ElMessage.success('已清空并重新载入演示数据')
 }
 
@@ -328,7 +347,7 @@ function verdictColor(verdict: string): string {
         <el-card shadow="never" style="margin-top: 16px">
           <template #header>整库导出</template>
           <p class="gb-muted">
-            导出文件包含 6 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+            导出文件包含 10 张业务表全量数据（含占用 / 调阅单 / 预约 / 本侧重试发件箱）与结构版本号，可在其他设备通过「导入 JSON」还原。
           </p>
           <div class="gb-toolbar">
             <el-button :icon="Download" @click="handleExport">JSON 备份</el-button>
