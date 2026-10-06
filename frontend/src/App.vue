@@ -3,13 +3,14 @@
  * 应用外壳：品牌头 + 胶囊导航 + 页脚统计
  * 首屏初始化 IndexedDB（首次自动播种演示数据）并载入 Pinia store。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Brush, Document, Files, Reading, Tools } from '@element-plus/icons-vue'
+import { Brush, Connection, Document, Files, Reading, Tools } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useCoordinationStore } from '@/stores/coordinationStore'
 import { initDatabase } from '@/utils/db'
 import { useLeafStats } from '@/hooks/useLeafStats'
 
@@ -18,13 +19,20 @@ const router = useRouter()
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const coordStore = useCoordinationStore()
 const { totals } = useLeafStats()
 const ready = ref(false)
 
 onMounted(async () => {
   try {
     await initDatabase()
-    await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+    await Promise.all([
+      bookStore.loadBooks(),
+      bookStore.loadVolumes(),
+      leafStore.loadLeaves(),
+      repairStore.loadOrders(),
+      coordStore.loadAll()
+    ])
   } catch (error) {
     ElMessage.error(`本地数据库初始化失败：${error instanceof Error ? error.message : '未知错误'}`)
   } finally {
@@ -45,11 +53,26 @@ const navItems = computed(() => {
     },
     { path: '/papers', label: '补纸选配', icon: Brush, badge: '', disabled: false },
     { path: '/repairs', label: '修复工序', icon: Tools, badge: String(repairStore.totalSteps), disabled: false },
+    {
+      path: '/desk',
+      label: '占用协调',
+      icon: Connection,
+      badge: coordStore.heldCount + coordStore.readyCount > 0 ? String(coordStore.heldCount + coordStore.readyCount) : '',
+      disabled: false
+    },
     { path: '/export', label: '装订归档', icon: Files, badge: '', disabled: false }
   ]
 })
 
 const activePath = computed(() => (route.path.startsWith('/books/') ? route.path : route.path))
+
+// 占用 / 调阅单在修复室页、协调台会发生变化；切回相关路由时重新拉取，保证徽标实时
+watch(
+  () => route.path,
+  (path) => {
+    if (path === '/desk' || path === '/repairs') void coordStore.loadAll()
+  }
+)
 
 function go(path: string, disabled: boolean): void {
   if (disabled) {

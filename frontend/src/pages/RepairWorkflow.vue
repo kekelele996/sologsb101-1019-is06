@@ -6,7 +6,7 @@
  */
 import { computed, reactive, ref, watch, watchEffect } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Check, Delete, Edit, Plus, Rank } from '@element-plus/icons-vue'
+import { Check, Delete, Edit, Plus, Rank, RefreshRight, Warning } from '@element-plus/icons-vue'
 import DamageTag from '@/components/common/DamageTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { useFilterQuery, type FilterModel } from '@/components/common/FilterBar.vue'
@@ -29,11 +29,61 @@ import {
   type RepairOrderDraft
 } from '@/types/repairOrder'
 import { PAPER_TYPE_LABEL, type Paper } from '@/types/paper'
+import type { RepairOperation } from '@/types/repairOperation'
+import { REPAIR_OP_STATE_COLOR, REPAIR_OP_STATE_LABEL } from '@/types/repairOperation'
+import { armFault, disarmFault, isFaultArmed, registerOrderAdvance, retryFailedOps } from '@/utils/repairDesk'
 
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+// 修复室本侧重试队列：登记工序失败只重试这几条，不触碰库房调阅单
+const opTable = useIdbTable<RepairOperation>((database) => database.repairOps, { sortByUpdatedAt: false })
+
+const faultArmed = ref(isFaultArmed())
+const failedOps = computed(() => opTable.rows.value.filter((op) => op.state === 'failed'))
+
+function onFaultChange(value: boolean | string | number): void {
+  const armed = Boolean(value)
+  if (armed) {
+    armFault()
+    ElMessage.warning('已模拟故障：下一次「推进状态 / 登记工序」将在修复室本侧写入中途失败')
+  } else {
+    disarmFault()
+  }
+  faultArmed.value = armed
+}
+
+/** 修复室登记工序（走本侧操作记录，失败只留修复侧失败账，库房调阅单不动） */
+async function registerAdvance(order: RepairOrder): Promise<void> {
+  const list = repairStore.ordersOfLeaf(order.leafId)
+  const previous = list.find((item) => item.seq === order.seq - 1)
+  if (previous && previous.state !== 'done') {
+    ElMessage.warning(`第 ${previous.seq} 道「${REPAIR_NAME_LABEL[previous.name]}」尚未完成，禁止推进`)
+    return
+  }
+  const result = await registerOrderAdvance(order)
+  await repairStore.loadOrders()
+  await leafStore.loadLeaves()
+  faultArmed.value = isFaultArmed()
+  if (result.failed) {
+    ElMessage.error(`登记工序失败（仅修复室本侧）：${result.message}，可调阅单未受影响，请在下方重试本侧`)
+  } else {
+    ElMessage.success(result.message || '工序已登记')
+  }
+}
+
+/** 只重试修复室本侧失败的那几条；库房调阅单 / 预约全程不参与 */
+async function retryOps(): Promise<void> {
+  const result = await retryFailedOps()
+  await repairStore.loadOrders()
+  await leafStore.loadLeaves()
+  if (result.stillFailed === 0) {
+    ElMessage.success(`本侧重试成功 ${result.succeeded} 条，库房调阅单始终未动`)
+  } else {
+    ElMessage.warning(`成功 ${result.succeeded} 条，仍有 ${result.stillFailed} 条失败（仅修复室本侧）`)
+  }
+}
 
 const FILTER_KEYS = ['name', 'state'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -189,14 +239,8 @@ async function remove(order: RepairOrder): Promise<void> {
 }
 
 async function advance(order: RepairOrder): Promise<void> {
-  const list = repairStore.ordersOfLeaf(order.leafId)
-  const previous = list.find((item) => item.seq === order.seq - 1)
-  if (previous && previous.state !== 'done') {
-    ElMessage.warning(`第 ${previous.seq} 道「${REPAIR_NAME_LABEL[previous.name]}」尚未完成，禁止推进`)
-    return
-  }
-  const next = await repairStore.advanceOrder(order.id)
-  ElMessage.success(`已置为「${ORDER_STATE_LABEL[next]}」${next === 'done' ? '，并回写书叶状态' : ''}`)
+  // 走修复室本侧操作记录：失败留本侧失败账，只重试本侧，库房调阅单不动
+  await registerAdvance(order)
 }
 
 async function generate(): Promise<void> {
@@ -282,6 +326,38 @@ watchEffect(() => {
       <StatBadge label="未开始" :value="stat.todo" suffix="道" />
       <StatBadge label="全局完成率" :value="`${repairStore.donePercent}%`" :percent="repairStore.donePercent" tone="info" />
     </div>
+
+    <!-- 修复室本侧登记：故障注入 + 只重试本侧（库房调阅单全程不动） -->
+    <el-card shadow="never" class="gb-retry-panel">
+      <div class="gb-toolbar" style="flex-wrap: wrap">
+        <div class="gb-retry-panel__lead">
+          <el-icon color="#c0392b"><Warning /></el-icon>
+          <strong>登记工序失败 · 只重试修复室本侧</strong>
+        </div>
+        <span class="gb-muted">库房调阅单 / 预约不参与此事务，失败与重试都不动它们</span>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 12px">
+          <span class="gb-muted">模拟下一次登记失败</span>
+          <el-switch :model-value="faultArmed" @update:model-value="onFaultChange" />
+          <el-button type="danger" plain size="small" :icon="RefreshRight" :disabled="failedOps.length === 0" @click="retryOps">
+            重试本侧 {{ failedOps.length > 0 ? `（${failedOps.length}）` : '' }}
+          </el-button>
+        </div>
+      </div>
+      <div v-if="failedOps.length > 0" class="gb-retry-list">
+        <div v-for="op in failedOps" :key="op.id" class="gb-retry-item">
+          <el-tag
+            effect="plain"
+            round
+            :style="{ color: REPAIR_OP_STATE_COLOR[op.state], borderColor: `${REPAIR_OP_STATE_COLOR[op.state]}66` }"
+          >
+            {{ REPAIR_OP_STATE_LABEL[op.state] }}
+          </el-tag>
+          <span class="gb-muted">工序 {{ op.orderId }} → {{ ORDER_STATE_LABEL[op.targetOrderState] }}</span>
+          <span class="gb-muted">已尝试 {{ op.attempts }} 次</span>
+          <span class="gb-retry-item__err">{{ op.lastError }}</span>
+        </div>
+      </div>
+    </el-card>
 
     <el-card v-if="currentLeaf" shadow="never" style="margin-bottom: 14px">
       <div class="gb-toolbar">
@@ -399,3 +475,40 @@ watchEffect(() => {
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.gb-retry-panel {
+  margin: 14px 0;
+  border-color: #e6cfb8;
+  background: #fdf7ef;
+}
+
+.gb-retry-panel__lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gb-retry-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gb-retry-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #fff;
+  border: 1px dashed #e0b4a4;
+  font-size: 12px;
+}
+
+.gb-retry-item__err {
+  color: #c0392b;
+}
+</style>
